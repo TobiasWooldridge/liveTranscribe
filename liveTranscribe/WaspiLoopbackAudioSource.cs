@@ -1,108 +1,115 @@
-﻿using EchoSharp.Audio;
+using EchoSharp.Audio;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+using System.Buffers;
+using System.IO;
 
 namespace liveTranscribe
 {
-    internal class WaspiLoopbackAudioSource : AwaitableWaveFileSource
+    internal sealed class WaspiLoopbackAudioSource : AwaitableWaveFileSource
     {
-        WasapiLoopbackCapture waveloop;
-        WaveFormat format;
-        WaveFormat inFormat;
-        private WaveFileWriter? waveFile;
+        private readonly WasapiLoopbackCapture loopbackCapture;
+        private readonly WaveFormat inputFormat;
 
-        public byte[] ToPCM16(byte[] buffer, int length, WaveFormat format)
+        public WaspiLoopbackAudioSource()
         {
-            if (length == 0)
-            {
-                return new byte[0];
-            }
+            loopbackCapture = new WasapiLoopbackCapture();
+            inputFormat = loopbackCapture.WaveFormat;
 
-            using var memStream = new MemoryStream(buffer, 0, length);
-            using var inputStream = new RawSourceWaveStream(memStream, format);
-
-            var convertedPCM = new SampleToWaveProvider16(
-                    new WdlResamplingSampleProvider(
-                        new WaveToSampleProvider(inputStream), 16000)
-                );
-
-            byte[] convertedBuffer = new byte[length];
-
-            using var stream = new MemoryStream();
-            int read;
-
-            while ((read = convertedPCM.Read(convertedBuffer, 0, length)) > 0)
-                stream.Write(convertedBuffer, 0, read);
-
-            return stream.ToArray();
-        }
-
-        public WaspiLoopbackAudioSource() : base(aggregationStrategy: DefaultChannelAggregationStrategies.SelectChannel(0))
-        {
-            
-            waveloop = new WasapiLoopbackCapture();
-
-            Initialize(new AudioSourceHeader()
+            Initialize(new AudioSourceHeader
             {
                 BitsPerSample = 16,
                 Channels = 1,
                 SampleRate = 16000
             });
-            
-            
-            //format = new WaveFormat(16000, 2);
-            inFormat = WaveFormat.CreateIeeeFloatWaveFormat(48000, 2);
-            
-            waveloop.DataAvailable += Waveloop_DataAvailable;
-            waveloop.RecordingStopped += Waveloop_RecordingStopped;
+
+            loopbackCapture.DataAvailable += OnDataAvailable;
+            loopbackCapture.RecordingStopped += OnRecordingStopped;
         }
 
         public void StartRecording()
         {
-            waveloop.StartRecording();
-            //waveFile = new WaveFileWriter("testStream.wav", format);
+            loopbackCapture.StartRecording();
         }
 
         public void StopRecording()
         {
-            waveloop.StopRecording();
-            //waveFile?.Flush();
-            //waveFile?.Close();
+            loopbackCapture.StopRecording();
+        }
+
+        private byte[] ConvertToPcm16(byte[] buffer, int bytesRecorded)
+        {
+            if (bytesRecorded <= 0)
+            {
+                return Array.Empty<byte>();
+            }
+
+            using var memoryStream = new MemoryStream(buffer, 0, bytesRecorded, writable: false);
+            using var rawStream = new RawSourceWaveStream(memoryStream, inputFormat);
+
+            ISampleProvider sampleProvider = new WaveToSampleProvider(rawStream);
+            if (sampleProvider.WaveFormat.Channels > 1)
+            {
+                sampleProvider = new StereoToMonoSampleProvider(sampleProvider)
+                {
+                    LeftVolume = 0.5f,
+                    RightVolume = 0.5f
+                };
+            }
+
+            var resampled = new WdlResamplingSampleProvider(sampleProvider, 16000);
+            var pcmProvider = new SampleToWaveProvider16(resampled);
+
+            using var outputStream = new MemoryStream();
+            var rentedBuffer = ArrayPool<byte>.Shared.Rent(4096);
+            try
+            {
+                int read;
+                while ((read = pcmProvider.Read(rentedBuffer, 0, rentedBuffer.Length)) > 0)
+                {
+                    outputStream.Write(rentedBuffer, 0, read);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rentedBuffer);
+            }
+
+            return outputStream.ToArray();
+        }
+
+        private void OnDataAvailable(object? sender, WaveInEventArgs e)
+        {
+            var converted = ConvertToPcm16(e.Buffer, e.BytesRecorded);
+            if (converted.Length == 0)
+            {
+                return;
+            }
+
+            WriteData(converted.AsMemory());
+        }
+
+        private void OnRecordingStopped(object? sender, StoppedEventArgs e)
+        {
+            if (e.Exception != null)
+            {
+                throw e.Exception;
+            }
+
+            Flush();
         }
 
         protected override void Dispose(bool disposing)
         {
             if (disposing)
             {
-                waveloop.DataAvailable -= Waveloop_DataAvailable;
-                waveloop.RecordingStopped -= Waveloop_RecordingStopped;
-                waveloop.Dispose();
+                loopbackCapture.DataAvailable -= OnDataAvailable;
+                loopbackCapture.RecordingStopped -= OnRecordingStopped;
+                loopbackCapture.Dispose();
             }
+
             base.Dispose(disposing);
-        }
-
-        private void Waveloop_DataAvailable(object? sender, WaveInEventArgs e)
-        {
-
-
-
-            var buffer = ToPCM16(e.Buffer, e.BytesRecorded, inFormat);
-            //waveFile?.Write(buffer, 0, buffer.Length);
-            WriteData(buffer.AsMemory(0, buffer.Length));
-        }
-
-        private void Waveloop_RecordingStopped(object? sender, StoppedEventArgs e)
-        {
-            if (e.Exception != null)
-            {
-                throw e.Exception;
-            }
-            Flush();
         }
     }
 }
