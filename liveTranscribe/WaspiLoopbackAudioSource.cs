@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using System.IO;
 
 namespace liveTranscribe
 {
@@ -16,7 +17,7 @@ namespace liveTranscribe
         WaveFormat inFormat;
         private WaveFileWriter? waveFile;
 
-        public byte[] ToPCM16(byte[] buffer, int length, WaveFormat format)
+        public byte[] ToPCM16(byte[] buffer, int length)
         {
             if (length == 0)
             {
@@ -24,7 +25,7 @@ namespace liveTranscribe
             }
 
             using var memStream = new MemoryStream(buffer, 0, length);
-            using var inputStream = new RawSourceWaveStream(memStream, format);
+            using var inputStream = new RawSourceWaveStream(memStream, inFormat);
 
             var convertedPCM = new SampleToWaveProvider16(
                     new WdlResamplingSampleProvider(
@@ -44,8 +45,9 @@ namespace liveTranscribe
 
         public WaspiLoopbackAudioSource() : base(aggregationStrategy: DefaultChannelAggregationStrategies.SelectChannel(0))
         {
-            
+
             waveloop = new WasapiLoopbackCapture();
+            inFormat = waveloop.WaveFormat;
 
             Initialize(new AudioSourceHeader()
             {
@@ -53,11 +55,10 @@ namespace liveTranscribe
                 Channels = 1,
                 SampleRate = 16000
             });
-            
-            
+
+
             //format = new WaveFormat(16000, 2);
-            inFormat = WaveFormat.CreateIeeeFloatWaveFormat(48000, 2);
-            
+
             waveloop.DataAvailable += Waveloop_DataAvailable;
             waveloop.RecordingStopped += Waveloop_RecordingStopped;
         }
@@ -91,13 +92,19 @@ namespace liveTranscribe
 
 
 
-            var buffer = ToPCM16(e.Buffer, e.BytesRecorded, inFormat);
+            var buffer = ToPCM16(e.Buffer, e.BytesRecorded);
             //waveFile?.Write(buffer, 0, buffer.Length);
             WriteData(buffer.AsMemory(0, buffer.Length));
         }
 
         private void Waveloop_RecordingStopped(object? sender, StoppedEventArgs e)
         {
+            var latestFormat = waveloop.WaveFormat;
+            if (!latestFormat.Equals(inFormat))
+            {
+                inFormat = latestFormat;
+            }
+
             if (e.Exception != null)
             {
                 throw e.Exception;
